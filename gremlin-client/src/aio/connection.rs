@@ -30,6 +30,7 @@ use async_tungstenite::async_std::connect_async_with_tls_connector;
 #[cfg(feature = "tokio-runtime")]
 use async_tungstenite::tokio::{connect_async_with_tls_connector, TokioAdapter};
 
+use async_tungstenite::tungstenite::client::IntoClientRequest;
 use async_tungstenite::tungstenite::protocol::Message;
 use async_tungstenite::WebSocketStream;
 use async_tungstenite::{self, stream};
@@ -68,6 +69,46 @@ pub(crate) struct Conn {
 impl std::fmt::Debug for Conn {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "Conn")
+    }
+}
+
+#[cfg(feature = "neptune-authentication")]
+mod neptune_authentication {
+    use async_tungstenite::tungstenite::handshake::client::Request;
+    use aws_types::credentials::ProvideCredentials;
+    use aws_types::region::{Region, SigningRegion};
+    use aws_types::SigningService;
+    use aws_sig_auth::signer::{OperationSigningConfig, RequestConfig, SigV4Signer};
+    use aws_smithy_http::body::SdkBody;
+    use std::time::SystemTime;
+    use crate::{GremlinError, GremlinResult};
+
+    pub async fn sign_request(req: Request, region: &Region, credentials: &impl ProvideCredentials) -> GremlinResult<Request> {
+        let now = SystemTime::now();
+        let signer = SigV4Signer::new();
+        let request_config = RequestConfig {
+            request_ts: now,
+            region: &SigningRegion::from(region.clone()),
+            service: &SigningService::from_static("neptune-db"),
+            payload_override: None,
+        };
+
+        // The AWS signer expects an AWS SDK body, whereas there's no body for our websocket requests, so we need to convert
+        // back and forth to sign and return the right types.
+        let (parts, _) = req.into_parts();
+        let mut out = http::Request::from_parts(parts, SdkBody::empty());
+
+        signer.sign(
+            &OperationSigningConfig::default_config(),
+            &request_config,
+            &credentials.provide_credentials().await.map_err(|x| GremlinError::Generic(x.to_string()))?,
+            &mut out,
+        ).map_err(|x| GremlinError::Generic(x.to_string()))?;
+
+        // Convert back into a Request<()>. Since both are conceptually empty, just have different types, the signature should
+        // be unaffected.
+        let (out_parts, _) = out.into_parts();
+        Ok(Request::from_parts(out_parts, ()))
     }
 }
 
@@ -128,12 +169,29 @@ impl Conn {
         T: Into<ConnectionOptions>,
     {
         let opts = options.into();
-        let url = url::Url::parse(&opts.websocket_url()).expect("failed to pars url");
+        let url = url::Url::parse(&opts.websocket_url()).expect("failed to parse url");
+
+        let mut request = url.into_client_request().expect("failed to construct request");
+
+        #[cfg(feature = "neptune-authentication")]
+        request.headers_mut().insert("host", match &opts.host_header_override {
+            Some(value) => value.clone(),
+            None => format!("{}:{}", opts.host, opts.port),
+        }.parse().expect("invalid host specified for gremlin connection"));
+
+        #[cfg(feature = "neptune-authentication")]
+        let final_request = match &opts.neptune_auth_options {
+            Some((region, creds)) => neptune_authentication::sign_request(request, region, creds).await?,
+            None => request,
+        };
+
+        #[cfg(not(feature = "neptune-authentication"))]
+        let final_request = request;
 
         #[cfg(feature = "async-std-runtime")]
-        let (client, _) = { connect_async_with_tls_connector(url, tls::connector(&opts)).await? };
+        let (client, _) = { connect_async_with_tls_connector(final_request, tls::connector(&opts)).await? };
         #[cfg(feature = "tokio-runtime")]
-        let (client, _) = { connect_async_with_tls_connector(url, tls::connector(&opts)).await? };
+        let (client, _) = { connect_async_with_tls_connector(final_request, tls::connector(&opts)).await? };
 
         let (sink, stream) = client.split();
         let (sender, receiver) = channel(20);
@@ -280,5 +338,23 @@ mod tests {
     #[cfg_attr(feature = "tokio-runtime", tokio::test)]
     async fn it_should_connect() {
         Conn::connect(("localhost", 8182)).await.unwrap();
+    }
+
+    #[cfg(feature = "neptune-authentication")]
+    #[cfg_attr(feature = "async-std-runtime", async_std::test)]
+    #[cfg_attr(feature = "tokio-runtime", tokio::test)]
+    async fn it_should_sign() {
+        let url = url::Url::parse("wss://myhost:8182").unwrap();
+
+        let mut req = url.into_client_request().unwrap();
+        req.headers_mut().insert("host", "myhost:8182".parse().unwrap());
+
+        let region = aws_types::region::Region::from_static("us-west-2");
+        let creds = aws_types::Credentials::from_keys("akid", "secret_key", None);
+
+        let signed_req = neptune_authentication::sign_request(req, &region, &creds).await.unwrap();
+
+        let auth_header = signed_req.headers().get("authorization").unwrap().to_str().unwrap();
+        assert!(auth_header.starts_with("AWS4-HMAC-SHA256 Credential=akid/"));
     }
 }

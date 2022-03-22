@@ -119,6 +119,18 @@ impl ConnectionOptionsBuilder {
         self.0.deserializer = deserializer;
         self
     }
+
+    #[cfg(feature = "neptune-authentication")]
+    pub fn neptune_auth_options(mut self, region: aws_types::region::Region, creds: aws_types::credentials::SharedCredentialsProvider) -> Self {
+        self.0.neptune_auth_options = Some((region, creds));
+        self
+    }
+
+    #[cfg(feature = "neptune-authentication")]
+    pub fn host_header_override(mut self, host: String) -> Self {
+        self.0.host_header_override = Some(host);
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +143,15 @@ pub struct ConnectionOptions {
     pub(crate) tls_options: Option<TlsOptions>,
     pub(crate) serializer: GraphSON,
     pub(crate) deserializer: GraphSON,
+
+    #[cfg(feature = "neptune-authentication")]
+    pub(crate) neptune_auth_options: Option<(aws_types::region::Region, aws_types::credentials::SharedCredentialsProvider)>,
+
+    // Sigv4 authentication needs to sign the host header, and Neptune at least actually cares about its contents. This override is
+    // useful if you've set up SSH port forwarding into your Neptune cluster and don't want the host header to match the host you
+    // actually need to connect to, while still having the authentication signature behave as expected.
+    #[cfg(feature = "neptune-authentication")]
+    pub(crate) host_header_override: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +176,12 @@ impl Default for ConnectionOptions {
             tls_options: None,
             serializer: GraphSON::V3,
             deserializer: GraphSON::V3,
+
+            #[cfg(feature = "neptune-authentication")]
+            neptune_auth_options: None,
+
+            #[cfg(feature = "neptune-authentication")]
+            host_header_override: None,
         }
     }
 }
